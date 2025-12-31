@@ -27,63 +27,62 @@ while True:
     lmList = detector.findPosition(img, draw=False)
 
     if len(lmList) != 0:
-        # --- 核心逻辑 1：视角判定 ---
-        # 计算左右肩膀的水平像素距离
-        shoulder_dist = abs(lmList[11][1] - lmList[12][1])
-        # 获取左右手的置信度
-        vis_left = lmList[13][3]  # 左肘置信度
-        vis_right = lmList[14][3]  # 右肘置信度
+        # --- 核心逻辑 1：利用 Z 轴深度差判定视角 ---
+        # 11: 左肩, 12: 右肩
+        z_left_shoulder = lmList[11][3]
+        z_right_shoulder = lmList[12][3]
+        z_diff = abs(z_left_shoulder - z_right_shoulder)
 
-        # 判定标准：肩膀距离小于某个阈值（例如画面宽度的12%）或者某一侧置信度极低
-        is_side_view = shoulder_dist < 150 or abs(vis_left - vis_right) > 0.3
+        # 获取置信度用于辅助判断侧面时哪只手在前
+        vis_left = lmList[13][4]
+        vis_right = lmList[14][4]
 
-        # --- 核心逻辑 2：获取当前有效百分比 ---
-        angleLeft = detector.findAngle(img, 11, 13, 15, draw=True)
-        angleRight = detector.findAngle(img, 12, 14, 16, draw=True)
+        # 根据你观察到的数据：正对时 0.0x，侧对时 0.35。取 0.2 作为阈值。
+        is_side_view = z_diff > 0.2
 
-        perLeft = np.interp(angleLeft, (50, 150), (100, 0))
-        perRight = np.interp(angleRight, (50, 150), (100, 0))
+        # --- 核心逻辑 2：计算 3D 角度 ---
+        # 开启 use_3d=True 可以在俯拍时获得更真实的物理角度
+        angleLeft = detector.findAngle(img, 11, 13, 15, use_3d=True, draw=True)
+        angleRight = detector.findAngle(img, 12, 14, 16, use_3d=True, draw=True)
+
+        # 映射逻辑 (根据 3D 角度调整阈值，3D 角度通常在 30-160 之间)
+        perLeft = np.interp(angleLeft, (40, 150), (100, 0))
+        perRight = np.interp(angleRight, (40, 150), (100, 0))
 
         if is_side_view:
-            # 侧面模式：选更清晰的那只手作为主控
-            view_mode = "SIDE VIEW"
-            main_per = perLeft if vis_left > vis_right else perRight
-            current_ready_to_count = main_per > 90
-            current_ready_to_relax = main_per < 10
+            view_mode = "SIDE (3D Z-Detect)"
+            # 侧面模式下，选 Z 轴更小（离镜头更近/更清晰）的那只手
+            main_per = perLeft if z_left_shoulder < z_right_shoulder else perRight
+            current_ready_to_count = main_per > 85
+            current_ready_to_relax = main_per < 15
         else:
-            # 正面模式：双臂必须同时达标
-            view_mode = "FRONT VIEW"
-            current_ready_to_count = perLeft > 90 and perRight > 90
-            current_ready_to_relax = perLeft < 10 and perRight < 10
+            view_mode = "FRONT (3D Z-Detect)"
+            current_ready_to_count = perLeft > 85 and perRight > 85
+            current_ready_to_relax = perLeft < 15 and perRight < 15
 
         # --- 核心逻辑 3：状态机计数 ---
-        if current_ready_to_count:
-            if dir == 0:
-                count += 0.5
-                dir = 1
-        if current_ready_to_relax:
-            if dir == 1:
-                count += 0.5
-                dir = 0
+        if current_ready_to_count and dir == 0:
+            count += 0.5
+            dir = 1
+        if current_ready_to_relax and dir == 1:
+            count += 0.5
+            dir = 0
 
-        # --- 绘制 UI ---
-        # 进度条逻辑保持不变 ...
-        # 计算进度条的 y 坐标映射
-        barLeft = np.interp(angleLeft, (50, 160), (100, 650))
-        barRight = np.interp(angleRight, (50, 160), (100, 650))
+        # --- 绘制 UI (修正了你代码中左右手进度条画反的小 Bug) ---
+        barLeft = np.interp(angleLeft, (40, 150), (100, 650))
+        barRight = np.interp(angleRight, (40, 150), (100, 650))
 
-        # 绘制左侧进度条 (Blue)
+        # 左侧 UI (显示左手数据)
         cv2.rectangle(img, (50, 100), (125, 650), (255, 0, 0), 3)
-        cv2.rectangle(img, (50, int(barRight)), (125, 650), (255, 0, 0), cv2.FILLED)
-        cv2.putText(img, f'{int(perRight)}%', (50, 75), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 0), 2)
+        cv2.rectangle(img, (50, int(barLeft)), (125, 650), (255, 0, 0), cv2.FILLED)
+        cv2.putText(img, f'L:{int(perLeft)}%', (50, 75), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 0), 2)
 
-        # 绘制右侧进度条 (Green)
+        # 右侧 UI (显示右手数据)
         cv2.rectangle(img, (1150, 100), (1225, 650), (0, 255, 0), 3)
-        cv2.rectangle(img, (1150, int(barLeft)), (1225, 650), (0, 255, 0), cv2.FILLED)
-        cv2.putText(img, f'{int(perLeft)}%', (1150, 75), cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 0), 2)
+        cv2.rectangle(img, (1150, int(barRight)), (1225, 650), (0, 255, 0), cv2.FILLED)
+        cv2.putText(img, f'R:{int(perRight)}%', (1150, 75), cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 0), 2)
 
-        # 绘制视角提示和总计数
-        cv2.putText(img, view_mode, (540, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 255, 0), 2)
+        cv2.putText(img, view_mode, (450, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 255, 0), 2)
         cv2.putText(img, str(int(count)), (580, 150), cv2.FONT_HERSHEY_PLAIN, 8, (255, 255, 255), 15)
 
     # ... FPS 和显示逻辑 ...
