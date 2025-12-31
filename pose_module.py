@@ -52,6 +52,9 @@ class poseDetector():
         if angle<0:
             angle+= 360
 
+        if angle > 180:
+            angle = 360 - angle
+
         #print(angle)
 
         #drawing circles for the 3 points in the consideration 
