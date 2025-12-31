@@ -15,7 +15,7 @@ pTime = 0
 
 print("正在启动摄像头，请稍候...")
 
-# ... 前面导入和初始化保持不变 ...
+show_all = False
 
 while True:
     success, img = cap.read()
@@ -23,7 +23,7 @@ while True:
     img = cv2.flip(img, 1)
     img = cv2.resize(img, (1280, 720))
 
-    img = detector.findPose(img, draw=False)
+    img = detector.findPose(img, draw=show_all)
     lmList = detector.findPosition(img, draw=False)
 
     if len(lmList) != 0:
@@ -38,12 +38,25 @@ while True:
         vis_right = lmList[14][4]
 
         # 根据你观察到的数据：正对时 0.0x，侧对时 0.35。取 0.2 作为阈值。
-        is_side_view = z_diff > 0.2
+        is_side_view = z_diff > 0.3
 
         # --- 核心逻辑 2：计算 3D 角度 ---
         # 开启 use_3d=True 可以在俯拍时获得更真实的物理角度
         angleLeft = detector.findAngle(img, 11, 13, 15, use_3d=True, draw=True)
         angleRight = detector.findAngle(img, 12, 14, 16, use_3d=True, draw=True)
+
+        if not show_all:
+            if is_side_view:
+                # 侧面：只连接离镜头近的那只手
+                if lmList[11][3] < lmList[12][3]:  # 左手在前
+                    detector.drawSpecificConnections(img, [11, 13, 15], (255, 0, 0))  # 蓝色线
+                else:  # 右手在前
+                    detector.drawSpecificConnections(img, [12, 14, 16], (255, 0, 0))  # 绿色线
+            else:
+                # 正面且不显示全骨架：只画双臂
+                detector.drawSpecificConnections(img, [11, 13, 15], (255, 255, 255))
+                detector.drawSpecificConnections(img, [12, 14, 16], (255, 255, 255))
+
 
         # 映射逻辑 (根据 3D 角度调整阈值，3D 角度通常在 30-160 之间)
         perLeft = np.interp(angleLeft, (40, 150), (100, 0))
@@ -95,11 +108,13 @@ while True:
     # 关键：显示窗口
     cv2.imshow("Pose Trainer", img)
 
-    # 按 'q' 键可以主动退出程序
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-    if cv2.waitKey(1) & 0xFF == ord(' '):
-        count =0
+    key = cv2.waitKey(1) & 0xFF
+    # --- 交互按键 ---
+    if key == ord('q'): break  # 退出
+    if key == ord(' '): count = 0  # 空格重置计数
+    if key == ord('v'):  # 按 'V' 键切换骨架可见性 (Visibility)
+        show_all = not show_all
+        print(f"Skeleton Visibility: {show_all}")
 
 cap.release()
 cv2.destroyAllWindows()

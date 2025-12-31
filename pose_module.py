@@ -7,19 +7,22 @@ class poseDetector():
     def __init__(self, mode=False, upBody=False, smooth=True, detectionCon=0.5, trackCon=0.5):
         self.mpDraw = mp.solutions.drawing_utils
         self.mpPose = mp.solutions.pose
-        # 建议使用复杂度 1，兼顾性能与 Z 轴预测
         self.pose = self.mpPose.Pose(static_image_mode=mode, model_complexity=1,
                                      smooth_landmarks=smooth,
                                      min_detection_confidence=detectionCon,
                                      min_tracking_confidence=trackCon)
+        self.show_skeleton = True
 
+    #是否识别到人像
     def findPose(self, img, draw=True):
         imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.results = self.pose.process(imgRGB)
-        if self.results.pose_landmarks and draw:
-            self.mpDraw.draw_landmarks(img, self.results.pose_landmarks, self.mpPose.POSE_CONNECTIONS)
+        if self.results.pose_landmarks:
+            if draw and self.show_skeleton:
+                self.mpDraw.draw_landmarks(img, self.results.pose_landmarks, self.mpPose.POSE_CONNECTIONS)
         return img
 
+    #识别到人像后进行角度计算。
     def findPosition(self, img, draw=True):
         self.lmList = []
         if self.results.pose_landmarks:
@@ -31,6 +34,14 @@ class poseDetector():
                 if draw:
                     cv2.circle(img, (cx, cy), 5, (255, 0, 0), cv2.FILLED)
         return self.lmList
+
+    #绘画
+    def drawSpecificConnections(self, img, points, color=(0, 255, 0)):
+        if len(self.lmList) != 0:
+            for i in range(len(points) - 1):
+                p1 = self.lmList[points[i]][1:3]
+                p2 = self.lmList[points[i + 1]][1:3]
+                cv2.line(img, (p1[0], p1[1]), (p2[0], p2[1]), color, 3)
 
     def findAngle(self, img, p1, p2, p3, use_3d=False, draw=True):
         # 1. 提取坐标
