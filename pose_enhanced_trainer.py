@@ -10,13 +10,14 @@ if not cap.isOpened():
 
 detector = pm.poseDetector()
 count = 0
-dir = 0
+dir = 0        # 0表示下降 1表示起来
 pTime = 0
 
 print("正在启动摄像头，请稍候...")
 
 #初始化部分
-show_all = False       #显示骨架
+show_user = True       #显示模式
+show_skel = False       #显示骨架
 hand_start_pos = None  # 记录手掌起始位置
 warning_list = []
 
@@ -26,7 +27,7 @@ while True:
     img = cv2.flip(img, 1)
     img = cv2.resize(img, (1280, 720))
 
-    img = detector.findPose(img, draw=show_all)
+    img = detector.findPose(img, draw=show_skel)
     lmList = detector.findPosition(img, draw=False)
 
     if len(lmList) != 0:
@@ -64,7 +65,7 @@ while True:
             dist_r = detector.getDistance(lmList[16][1:3], hand_r_anchor)
 
             # 阈值设为 40 像素（可根据相机远近调整）
-            if dist_l > 40 or dist_r > 40:
+            if dist_l > 20 or dist_r > 20:
                 form_feedback.append("手掌不要动")
         else:
             # 回到最高点时重置锚点，允许微调手位
@@ -86,14 +87,14 @@ while True:
         if is_side_view:
             # 根据哪边离镜头近选哪边
             if z_left_shoulder < z_right_shoulder:
-                back_angle = detector.findAngle(img, 11, 23, 25, use_3d=True, draw=show_all)
+                back_angle = detector.findAngle(img, 11, 23, 25, use_3d=True, draw=show_skel)
             else:
-                back_angle = detector.findAngle(img, 12, 24, 26, use_3d=True, draw=show_all)
+                back_angle = detector.findAngle(img, 12, 24, 26, use_3d=True, draw=show_skel)
 
             # 180度为直线，若小于 155度 说明腰部下塌或臀部过高
-            if back_angle < 150:
-                form_feedback.append("请收紧核心，不要塌腰或撅屁股")
-            if back_angle > 175:
+            if back_angle < 130:
+                form_feedback.append("请收紧核心，不要拱腰")
+            if back_angle > 170:
                 form_feedback.append("请收紧核心，不要塌腰或撅屁股")
 
         #状态机计数逻辑
@@ -105,10 +106,10 @@ while True:
             current_ready_to_count = perLeft > 85 and perRight > 85
             current_ready_to_relax = perLeft < 15 and perRight < 15
 
-        if current_ready_to_count and dir == 0:
+        if current_ready_to_count and dir == 0:   #下降
             count += 0.5
             dir = 1
-        if current_ready_to_relax and dir == 1:
+        if current_ready_to_relax and dir == 1:   #升起
             count += 0.5
             dir = 0
 
@@ -116,38 +117,38 @@ while True:
         # 绘制进度条
         barLeft = np.interp(angleLeft, (45, 155), (100, 650))
         barRight = np.interp(angleRight, (45, 155), (100, 650))
-        cv2.rectangle(img, (50, 100), (85, 650), (255, 0, 0), 3)
-        cv2.rectangle(img, (50, int(barLeft)), (85, 650), (255, 0, 0), cv2.FILLED)
-        cv2.rectangle(img, (1195, 100), (1230, 650), (0, 255, 0), 3)
-        cv2.rectangle(img, (1195, int(barRight)), (1230, 650), (0, 255, 0), cv2.FILLED)
+        if not show_user:
+            cv2.rectangle(img, (50, 100), (85, 650), (255, 0, 0), 3)
+            cv2.rectangle(img, (50, int(barRight)), (85, 650), (255, 0, 0), cv2.FILLED)
+            cv2.rectangle(img, (1195, 100), (1230, 650), (0, 255, 0), 3)
+            cv2.rectangle(img, (1195, int(barLeft)), (1230, 650), (0, 255, 0), cv2.FILLED)
+            # 视角显示
+            view_text = "SIDE VIEW" if is_side_view else "FRONT VIEW"
+            cv2.putText(img, view_text, (520, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 255, 0), 2)
 
         # 绘制计数
         cv2.putText(img, str(int(count)), (580, 150), cv2.FONT_HERSHEY_PLAIN, 10, (255, 255, 255), 20)
-
-        # 绘制提示信息 (Feedback)
-        #img = detector.putText_chinese(img, f"完成次数: {int(count)}", (550, 50), fontSize=60, color=(255, 255, 255))
 
         y_offset = 150
         for msg in list(set(form_feedback)):
             img = detector.putText_chinese(img, f"提示: {msg}", (400, y_offset), fontSize=35, color=(0, 0, 255))
             y_offset += 50
 
-        # 视角显示
-        view_text = "SIDE VIEW" if is_side_view else "FRONT VIEW"
-        cv2.putText(img, view_text, (520, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 255, 0), 2)
 
     # FPS 显示
     cTime = time.time()
     fps = 1 / (cTime - pTime)
     pTime = cTime
-    cv2.putText(img, f'FPS: {int(fps)}', (50, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 0), 2)
+    if not show_user:
+        cv2.putText(img, f'FPS: {int(fps)}', (50, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 0, 0), 2)
 
     cv2.imshow("Push-up Analyzer", img)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'): break
     if key == ord(' '): count = 0
-    if key == ord('v'): show_all = not show_all
+    if key == ord('v'): show_skel = not show_skel
+    if key == ord('u'): show_user = not show_user
 
 cap.release()
 cv2.destroyAllWindows()
