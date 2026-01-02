@@ -2,6 +2,7 @@ import cv2
 import mediapipe as mp
 import math
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 class poseDetector():
     def __init__(self, mode=False, upBody=False, smooth=True, detectionCon=0.5, trackCon=0.5):
@@ -42,6 +43,13 @@ class poseDetector():
                 p1 = self.lmList[points[i]][1:3]
                 p2 = self.lmList[points[i + 1]][1:3]
                 cv2.line(img, (p1[0], p1[1]), (p2[0], p2[1]), color, 3)
+
+    def getDistance(self, pos1, pos2):# 计算两点之间距离
+        return math.hypot(pos2[0] - pos1[0], pos2[1] - pos1[1])
+
+    def checkStraightness(self, p1, p2, p3):
+        # 逻辑同 findAngle，但主要用于检测 11-23-27 是否为 180 度
+        return self.findAngle(None, p1, p2, p3, use_3d=True, draw=False)
 
     def findAngle(self, img, p1, p2, p3, use_3d=False, draw=True):
         # 1. 提取坐标
@@ -104,3 +112,18 @@ class poseDetector():
                         cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 255), 2)
 
         return angle
+
+    #显示中文
+    def putText_chinese(self, img, text, position, fontSize=30, color=(0, 255, 0)):
+        # OpenCV 格式转为 PIL 格式
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        # 加载字体
+        try:
+            font = ImageFont.truetype("simsun.ttc", fontSize, encoding="utf-8")
+        except:
+            font = ImageFont.load_default()  # 如果找不到字体则使用默认
+
+        draw.text(position, text, font=font, fill=color)
+        # PIL 格式转回 OpenCV 格式
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
