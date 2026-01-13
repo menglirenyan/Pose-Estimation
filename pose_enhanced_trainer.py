@@ -52,8 +52,9 @@ while True:
 
         if is_side_view:
             up_limit, down_limit = 150, 75  # 侧面伸直要求低一些
-            main_per = np.interp(angleL, (down_limit, up_limit), (100, 0)) if lmList[11][3] < lmList[12][
-                3] else np.interp(angleR, (down_limit, up_limit), (100, 0))
+            main_per = np.interp(angleL, (down_limit, up_limit), (100, 0)) \
+                if lmList[11][3] < lmList[12][3] \
+                else np.interp(angleR, (down_limit, up_limit), (100, 0))
         else:
             up_limit, down_limit = 165, 50
             main_per = (np.interp(angleL, (down_limit, up_limit), (100, 0)) + np.interp(angleR, (down_limit, up_limit),
