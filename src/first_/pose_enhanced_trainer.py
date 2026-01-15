@@ -1,7 +1,7 @@
 import cv2
 import time
 import numpy as np
-import pose_module as pm
+from src.first_ import pose_module as pm
 
 # 状态常量定义
 STATE_IDLE = "待机"  # 人未趴下

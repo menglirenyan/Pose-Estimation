@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-df = pd.read_csv("pushup_dataset.csv")
+df = pd.read_csv("../../data/pushup_dataset.csv")
 
 # 只保留 UP / DOWN
 df = df[df["label"].isin([0, 1])]

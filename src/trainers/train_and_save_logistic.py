@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 # 1. 读取并清洗数据
 # =========================
 
-df = pd.read_csv("pushup_dataset.csv")
+df = pd.read_csv("../../data/pushup_dataset.csv")
 
 # 只保留 UP / DOWN（丢弃 -1）
 df = df[df["label"].isin([0, 1])]
@@ -62,10 +62,10 @@ for name, coef in zip(features, model.coef_[0]):
 # 5. 保存模型与 scaler
 # =========================
 
-os.makedirs("models", exist_ok=True)
+os.makedirs("../../models", exist_ok=True)
 
-joblib.dump(model, "models/logistic.joblib")
-joblib.dump(scaler, "models/scaler.joblib")
+joblib.dump(model, "../../models/logistic.joblib")
+joblib.dump(scaler, "../../models/scaler.joblib")
 
 print("模型已保存到 models/logistic.joblib")
 print("Scaler 已保存到 models/scaler.joblib")

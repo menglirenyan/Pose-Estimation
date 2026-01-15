@@ -2,15 +2,14 @@ import cv2
 import time
 import numpy as np
 import pandas as pd
-import joblib
 import os
-from model_wrapper import LogisticPushupModel, STATE_DOWN, STATE_UP, STATE_UNCERTAIN
+from src.models.model_wrapper import LogisticPushupModel, STATE_DOWN, STATE_UP, STATE_UNCERTAIN
 
 import mediapipe as mp
 
 # ------------------ 配置 ------------------
-MODEL_PATH = "models/logistic.joblib"
-SCALER_PATH = "models/scaler.joblib"
+MODEL_PATH = "../../models/logistic.joblib"  #包含权重和方差
+SCALER_PATH = "../../models/scaler.joblib"  #训练时的均值和方差
 THRESH = 0.75            # 概率阈值（可根据结果微调）
 MIN_CONSISTENT = 3      # 连续帧确认阈值
 OUTPUT_CSV = "realtime_results_single_model.csv"
@@ -52,6 +51,15 @@ def extract_features_from_landmarks(lm, frame_shape):
     # return feature vector in same order as training
     return np.array([left_elbow_angle, right_elbow_angle, shoulder_hip_dist])
 
+#mediapipe的可见方法
+def valid_pose(lm):
+    need = [11, 12, 13, 14, 15, 16]  # 肩肘腕
+    for idx in need:
+        if lm[idx].visibility < 0.6:
+            return False
+    return True
+
+
 # ------------------ 计数状态（单模型） ------------------
 last_stable_state = STATE_UNCERTAIN
 current_candidate = STATE_UNCERTAIN
@@ -91,6 +99,11 @@ while cap.isOpened():
         # if not horizontal, force uncertain
         if not is_horizontal:
             state = STATE_UNCERTAIN
+
+        #不合法
+        if not valid_pose(lm):
+            state = "NO_POSE"
+            continue
 
         # debounce
         if state == current_candidate:

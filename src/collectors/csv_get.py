@@ -40,7 +40,7 @@ pose = mp_pose.Pose(
 # =========================
 # CSV 初始化
 # =========================
-csv_file = open("pushup_dataset.csv", mode="w", newline="")
+csv_file = open("../../data/pushup_dataset.csv", mode="w", newline="")
 csv_writer = csv.writer(csv_file)
 
 # CSV 表头
