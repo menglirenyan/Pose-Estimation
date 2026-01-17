@@ -9,7 +9,7 @@ from sklearn.linear_model import LogisticRegression
 # 1. 读取数据
 # =========================
 
-df = pd.read_csv("data/pushup_dataset.csv")
+df = pd.read_csv("src/data/pushup_dataset.csv")
 df = df[df["label"].isin([0, 1])]
 
 features = [

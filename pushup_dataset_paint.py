@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 
 
-df = pd.read_csv("data/pushup_dataset.csv")
+df = pd.read_csv("src/data/pushup_dataset.csv")
 df = df[df["label"].isin([0, 1])]
 
 up = df[df["label"] == 1]
