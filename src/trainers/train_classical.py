@@ -39,7 +39,7 @@ def parse_args():
 
     p.add_argument("--data", default="../data/pushup_dataset.csv",
                    help="CSV file containing features and label")
-    p.add_argument("--outdir", default="src/models",
+    p.add_argument("--outdir", default=None,
                    help="Directory to save trained model and scaler")
 
     # 新增：随机种子
@@ -139,6 +139,11 @@ def train_one(model_name, X, y, args):
 # =========================
 def main():
     args = parse_args()
+    if args.outdir is None:
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)  # .../src/trainers
+        src_dir = os.path.dirname(script_dir)  # .../src
+        args.outdir = os.path.join(src_dir, "models")  # .../src/models
     X, y, _ = load_data(args.data)
 
     print(f"Loaded {len(y)} samples | UP={(y==1).sum()} DOWN={(y==0).sum()}")

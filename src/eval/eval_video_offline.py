@@ -1,19 +1,32 @@
-# eval_video_offline_batch.py
-# 一次运行：抽特征 + weak GT，然后评估所有模型，并写出 json/txt 日志
+#!/usr/bin/env python3
+"""
+eval_video_offline_v2.py
 
-#运行
-#python eval_video_offline.py --video your_video.mp4
+Offline evaluation from a recorded video:
+  - MediaPipe Pose -> 3 features per frame
+  - Weak GT label_rule() -> y_true per frame (0/1/-1)
+  - Evaluate selected models:
+      * sklearn (logistic/mlp) in frame mode
+      * torch seq (lstm/lstm_attn/tcn) in window mode (sliding buffer)
 
-#临时只评估两个模型
-#python eval_video_offline.py --video your_video.mp4 --models mlp lstm_attn
+Outputs per model:
+  1) Classification metrics:
+     - confusion matrix
+     - classification report
+  2) Counting metrics (NEW):
+     - count_true / count_pred / abs_error
+     - counting uses a debounce FSM and a configurable transition (down2up or up2down)
 
-#把 -1 三分类也纳入评估
-#python eval_video_offline.py --video your_video.mp4 --include_uncertain
+Important note (thesis wording):
+  GT here is pseudo-label / weak supervision (rule-based), not manual annotation.
 
+Examples
+  python src/eval/eval_video_offline_v2.py --video demo.mp4
+  python src/eval/eval_video_offline_v2.py --video demo.mp4 --models lstm_attn tcn
+  python src/eval/eval_video_offline_v2.py --video demo.mp4 --include_uncertain
+"""
 
 import os
-import json
-import time
 import argparse
 from collections import deque
 
@@ -23,48 +36,28 @@ import joblib
 from sklearn.metrics import confusion_matrix, classification_report
 import mediapipe as mp
 
+
 DOWN = 0
 UP = 1
 UNCERTAIN = -1
 
-# =========================
-# Default config (edit here)
-# =========================
-DEFAULT_CFG = {
-    "models_dir": "../models",
-    "models": ["logistic", "mlp", "lstm", "lstm_attn"],  # default: evaluate all
-    "seq_len": 16,
-    "thresh": 0.75,          # sklearn confidence threshold
-    "device": "cpu",
-
-    # pose filter
-    "vis_thresh": 0.25,
-    "min_ok": 4,
-
-    # mediapipe knobs (side-view friendly)
-    "model_complexity": 2,
-    "det_conf": 0.3,
-    "track_conf": 0.3,
-
-    # evaluation
-    "include_uncertain": False,
-    "max_frames": 0,
-    "progress_every": 50,
-
-    # output
-    "out_dir": "eval_outputs",
-}
 
 # =========================
 # Feature extraction
 # =========================
 def calculate_angle(a, b, c):
     a = np.array(a); b = np.array(b); c = np.array(c)
-    ba = a - b
-    bc = c - b
+    ba = a - b; bc = c - b
     denom = (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
     cos_angle = np.dot(ba, bc) / denom
     return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+
+
+def valid_pose(lm, vis_thresh=0.6, min_ok=8):
+    need = [11, 12, 13, 14, 15, 16, 23, 24]
+    ok = sum(1 for i in need if lm[i].visibility >= vis_thresh)
+    return ok >= min_ok
+
 
 def extract_features_from_landmarks(lm, frame_shape):
     h, w = frame_shape[:2]
@@ -81,22 +74,20 @@ def extract_features_from_landmarks(lm, frame_shape):
 
     shoulder_y = (ls[1] + rs[1]) / 2.0
     hip_y = (lh[1] + rh[1]) / 2.0
-    shoulder_hip_dist = (hip_y - shoulder_y) / h  # normalized
+    shoulder_hip_dist = (hip_y - shoulder_y) / h
 
     return np.array([left_elbow_angle, right_elbow_angle, shoulder_hip_dist], dtype=np.float32)
 
-def valid_pose_side_friendly(lm, vis_thresh=0.25, min_ok=4):
-    need = [11, 12, 13, 14, 15, 16, 23, 24]
-    ok = sum(lm[i].visibility >= vis_thresh for i in need)
-    return ok >= min_ok
 
+# =========================
+# Weak GT rule (pseudo label)
+# =========================
 def label_rule(lm, feats, horiz_thresh=0.35, zdiff_thresh=0.2):
     left_elbow_angle, right_elbow_angle, shoulder_hip_dist = feats.tolist()
     is_horizontal = shoulder_hip_dist < horiz_thresh
 
     z_diff = abs(lm[11].z - lm[12].z)
     if z_diff > zdiff_thresh:
-        # side view
         if lm[11].z > lm[12].z:
             view_type = 1
             main_elbow_angle = left_elbow_angle
@@ -104,7 +95,6 @@ def label_rule(lm, feats, horiz_thresh=0.35, zdiff_thresh=0.2):
             view_type = 2
             main_elbow_angle = right_elbow_angle
     else:
-        # front view
         view_type = 0
         main_elbow_angle = (left_elbow_angle + right_elbow_angle) / 2
 
@@ -122,10 +112,49 @@ def label_rule(lm, feats, horiz_thresh=0.35, zdiff_thresh=0.2):
                 label = DOWN
     return label
 
+
+# =========================
+# Counting (debounce FSM)
+# =========================
+def count_reps(states, min_consistent=4, transition="down2up", ignore_uncertain=True):
+    """
+    states: iterable of {0,1,-1} (or torch-class {0,1,2} mapped beforehand)
+    Counting uses stable-state debounce.
+
+    ignore_uncertain=True:
+      - UNCERTAIN frames do not contribute to candidate stability.
+    """
+    last_stable = UNCERTAIN
+    cand = UNCERTAIN
+    cand_cnt = 0
+    reps = 0
+
+    for s in states:
+        if ignore_uncertain and s == UNCERTAIN:
+            continue
+
+        if s == cand:
+            cand_cnt += 1
+        else:
+            cand = s
+            cand_cnt = 1
+
+        if cand_cnt >= min_consistent and s != last_stable:
+            prev = last_stable
+            last_stable = s
+
+            if transition == "down2up" and prev == DOWN and s == UP:
+                reps += 1
+            elif transition == "up2down" and prev == UP and s == DOWN:
+                reps += 1
+
+    return reps
+
+
 # =========================
 # Model loaders
 # =========================
-def load_sklearn_predictor(models_dir, model_name, thresh=0.75):
+def load_sklearn(models_dir, model_name, thresh=0.75):
     model_path = os.path.join(models_dir, f"{model_name}.joblib")
     scaler_path = os.path.join(models_dir, f"scaler_{model_name}.joblib")
     if not os.path.exists(model_path):
@@ -138,15 +167,15 @@ def load_sklearn_predictor(models_dir, model_name, thresh=0.75):
 
     classes_ = list(getattr(model, "classes_", [0, 1]))
     if 0 not in classes_ or 1 not in classes_:
-        raise ValueError(f"Sklearn model classes_ must include 0 and 1, got: {classes_}")
-    idx_down = classes_.index(0)
-    idx_up = classes_.index(1)
+        raise ValueError(f"Sklearn model classes_ must include 0 and 1, got {classes_}")
+    idx0 = classes_.index(0)
+    idx1 = classes_.index(1)
 
-    def predict_frame(feat_3):
-        x = scaler.transform(np.asarray(feat_3, dtype=np.float32).reshape(1, -1))
+    def predict_frame(feat3):
+        x = scaler.transform(np.asarray(feat3, dtype=np.float32).reshape(1, -1))
         proba = model.predict_proba(x)[0]
-        p_down = float(proba[idx_down])
-        p_up = float(proba[idx_up])
+        p_down = float(proba[idx0])
+        p_up = float(proba[idx1])
         if p_up >= thresh and p_up > p_down:
             return UP
         if p_down >= thresh and p_down > p_up:
@@ -155,68 +184,36 @@ def load_sklearn_predictor(models_dir, model_name, thresh=0.75):
 
     return predict_frame
 
-#读取模型参数
-def collect_model_params(models_dir, model_name):
+
+def load_torch_seq(models_dir, model_name, device="cpu", seq_len=16):
     """
-    Return a JSON-serializable dict of model parameters / metadata.
-    For sklearn: uses get_params().
-    For torch: reads checkpoint dict with 'hparams' (requires training script save).
+    Loads a 3-class torch seq model and returns a per-frame predictor using an internal buffer.
+
+    Expected filenames:
+      - lstm:      lstm.pt + scaler_lstm.joblib
+      - lstm_attn: lstm_attn.pt + scaler_lstm_attn.joblib
+      - tcn:       tcn.pt + scaler_tcn.joblib
     """
-    model_name = model_name.lower()
-
-    if model_name in ("logistic", "mlp"):
-        model_path = os.path.join(models_dir, f"{model_name}.joblib")
-        scaler_path = os.path.join(models_dir, f"scaler_{model_name}.joblib")
-
-        model = joblib.load(model_path)
-        scaler = joblib.load(scaler_path)
-
-        meta = {
-            "model_path": os.path.abspath(model_path),
-            "scaler_path": os.path.abspath(scaler_path),
-            "sklearn_estimator": type(model).__name__,
-            "sklearn_params": model.get_params(deep=True),
-            "classes_": getattr(model, "classes_", None).tolist() if hasattr(model, "classes_") else None,
-            "scaler_mean_": getattr(scaler, "mean_", None).tolist() if hasattr(scaler, "mean_") else None,
-            "scaler_scale_": getattr(scaler, "scale_", None).tolist() if hasattr(scaler, "scale_") else None,
-        }
-        return meta
-
-    if model_name in ("lstm", "lstm_attn", "attn"):
-        if model_name == "lstm":
-            ckpt_path = os.path.join(models_dir, "lstm.pt")
-            scaler_path = os.path.join(models_dir, "scaler_lstm.joblib")
-        else:
-            ckpt_path = os.path.join(models_dir, "lstm_attn.pt")
-            scaler_path = os.path.join(models_dir, "scaler_lstm_attn.joblib")
-
-        import torch
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-
-        # ckpt may be state_dict only (old) or {"state_dict":..., "hparams":...} (new)
-        if isinstance(ckpt, dict) and ("hparams" in ckpt or "state_dict" in ckpt):
-            hparams = ckpt.get("hparams", {})
-        else:
-            hparams = {}  # cannot recover
-
-        scaler = joblib.load(scaler_path)
-
-        meta = {
-            "ckpt_path": os.path.abspath(ckpt_path),
-            "scaler_path": os.path.abspath(scaler_path),
-            "hparams": hparams,
-            "scaler_mean_": getattr(scaler, "mean_", None).tolist() if hasattr(scaler, "mean_") else None,
-            "scaler_scale_": getattr(scaler, "scale_", None).tolist() if hasattr(scaler, "scale_") else None,
-            "note": "If hparams is empty, your checkpoint was saved as state_dict only; update training script to save hparams.",
-        }
-        return meta
-
-    return {"note": f"Unknown model_name={model_name}"}
-
-
-def load_torch_predictor(models_dir, model_name, device="cpu"):
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
+
+    class PushupLSTM(nn.Module):
+        def __init__(self, input_size=3, hidden_size=64, num_layers=1,
+                     bidirectional=False, dropout=0.1, num_classes=3):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_size=input_size, hidden_size=hidden_size,
+                num_layers=num_layers, batch_first=True,
+                bidirectional=bidirectional,
+                dropout=dropout if num_layers > 1 else 0.0
+            )
+            hdim = hidden_size * (2 if bidirectional else 1)
+            self.fc = nn.Linear(hdim, num_classes)
+
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            return self.fc(out[:, -1, :])
 
     class TemporalAttention(nn.Module):
         def __init__(self, hidden_dim: int, attn_dim: int = 64):
@@ -224,107 +221,130 @@ def load_torch_predictor(models_dir, model_name, device="cpu"):
             self.proj = nn.Linear(hidden_dim, attn_dim)
             self.v = nn.Linear(attn_dim, 1, bias=False)
 
-        def forward(self, out):  # (B,T,H)
-            score = self.v(torch.tanh(self.proj(out))).squeeze(-1)  # (B,T)
-            alpha = torch.softmax(score, dim=1)                     # (B,T)
-            context = torch.sum(out * alpha.unsqueeze(-1), dim=1)   # (B,H)
-            return context, alpha
-
-    class PushupLSTM(nn.Module):
-        def __init__(self, input_size=3, hidden_size=64, num_layers=1,
-                     bidirectional=False, dropout=0.1, num_classes=3):
-            super().__init__()
-            self.lstm = nn.LSTM(
-                input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
-                batch_first=True, bidirectional=bidirectional,
-                dropout=dropout if num_layers > 1 else 0.0
-            )
-            hidden_dim = hidden_size * (2 if bidirectional else 1)
-            self.fc = nn.Linear(hidden_dim, num_classes)
-
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            last = out[:, -1, :]
-            return self.fc(last)
+        def forward(self, h):
+            u = torch.tanh(self.proj(h))
+            scores = self.v(u).squeeze(-1)
+            alpha = torch.softmax(scores, dim=1)
+            context = torch.sum(h * alpha.unsqueeze(-1), dim=1)
+            return context
 
     class PushupAttnLSTM(nn.Module):
         def __init__(self, input_size=3, hidden_size=64, num_layers=1,
                      bidirectional=False, dropout=0.1, num_classes=3, attn_dim=64):
             super().__init__()
             self.lstm = nn.LSTM(
-                input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
-                batch_first=True, bidirectional=bidirectional,
+                input_size=input_size, hidden_size=hidden_size,
+                num_layers=num_layers, batch_first=True,
+                bidirectional=bidirectional,
                 dropout=dropout if num_layers > 1 else 0.0
             )
-            self.hidden_dim = hidden_size * (2 if bidirectional else 1)
-            self.attn = TemporalAttention(self.hidden_dim, attn_dim=attn_dim)
-            self.fc = nn.Linear(self.hidden_dim, num_classes)
+            hdim = hidden_size * (2 if bidirectional else 1)
+            self.attn = TemporalAttention(hdim, attn_dim=attn_dim)
+            self.fc = nn.Linear(hdim, num_classes)
 
         def forward(self, x):
             out, _ = self.lstm(x)
-            context, _ = self.attn(out)
-            return self.fc(context)
+            ctx = self.attn(out)
+            return self.fc(ctx)
+
+    class TemporalBlock(nn.Module):
+        def __init__(self, in_ch, out_ch, kernel_size=3, dilation=1, dropout=0.1):
+            super().__init__()
+            pad = dilation * (kernel_size - 1) // 2
+            self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
+            self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
+            self.relu = nn.ReLU()
+            self.drop = nn.Dropout(dropout)
+            self.downsample = None
+            if in_ch != out_ch:
+                self.downsample = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+
+        def forward(self, x):
+            y = self.drop(self.relu(self.conv1(x)))
+            y = self.drop(self.relu(self.conv2(y)))
+            res = x if self.downsample is None else self.downsample(x)
+            return y + res
+
+    class PushupTCN(nn.Module):
+        def __init__(self, input_size=3, channels=(32, 64, 64), kernel_size=3, dropout=0.1, num_classes=3):
+            super().__init__()
+            layers = []
+            in_ch = input_size
+            dilation = 1
+            for out_ch in channels:
+                layers.append(TemporalBlock(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation, dropout=dropout))
+                in_ch = out_ch
+                dilation *= 2
+            self.net = nn.Sequential(*layers)
+            self.fc = nn.Linear(in_ch, num_classes)
+
+        def forward(self, x):
+            x = x.permute(0, 2, 1)
+            h = self.net(x)
+            h = h.mean(dim=2)
+            return self.fc(h)
+
+    if str(device).startswith("cuda") and (not torch.cuda.is_available()):
+        print("[WARN] cuda requested but not available. Falling back to cpu.")
+        device = "cpu"
+    dev = torch.device(device)
 
     if model_name == "lstm":
         ckpt_path = os.path.join(models_dir, "lstm.pt")
         scaler_path = os.path.join(models_dir, "scaler_lstm.joblib")
+        net = PushupLSTM(num_classes=3)
     elif model_name in ("lstm_attn", "attn"):
         ckpt_path = os.path.join(models_dir, "lstm_attn.pt")
         scaler_path = os.path.join(models_dir, "scaler_lstm_attn.joblib")
+        net = PushupAttnLSTM(num_classes=3)
+    elif model_name == "tcn":
+        ckpt_path = os.path.join(models_dir, "tcn.pt")
+        scaler_path = os.path.join(models_dir, "scaler_tcn.joblib")
+        net = PushupTCN(num_classes=3)
     else:
-        raise ValueError(f"Unknown torch model name: {model_name}")
+        raise ValueError(f"Unknown torch model: {model_name}")
 
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Missing torch checkpoint: {ckpt_path}")
+        raise FileNotFoundError(f"Missing checkpoint: {ckpt_path}")
     if not os.path.exists(scaler_path):
         raise FileNotFoundError(f"Missing scaler: {scaler_path}")
 
     scaler = joblib.load(scaler_path)
 
-    import torch
-    ckpt = torch.load(ckpt_path, map_location=device)
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-        hparams = ckpt.get("hparams", {})
-    else:
-        state_dict = ckpt
-        hparams = {}
+    state = torch.load(ckpt_path, map_location=dev)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
 
-    input_size = int(hparams.get("input_size", 3))
-    hidden_size = int(hparams.get("hidden_size", 64))
-    num_layers = int(hparams.get("num_layers", 1))
-    bidirectional = bool(hparams.get("bidirectional", False))
-    dropout = float(hparams.get("dropout", 0.1))
-    num_classes = int(hparams.get("num_classes", 3))
-    attn_dim = int(hparams.get("attn_dim", 64))
+    net.load_state_dict(state, strict=True)
+    net.to(dev).eval()
 
-    if model_name == "lstm":
-        net = PushupLSTM(input_size, hidden_size, num_layers, bidirectional, dropout, num_classes)
-    else:
-        net = PushupAttnLSTM(input_size, hidden_size, num_layers, bidirectional, dropout, num_classes, attn_dim)
+    buf = deque(maxlen=int(seq_len))
 
-    net.load_state_dict(state_dict, strict=True)
-    net.to(device)
-    net.eval()
-
-    def predict_window(seq_Tx3):
-        x = np.asarray(seq_Tx3, dtype=np.float32)
-        x = scaler.transform(x)
-        xt = torch.from_numpy(x).unsqueeze(0).to(device)
+    def predict_frame(feat3):
+        x = np.asarray(feat3, dtype=np.float32).reshape(1, -1)
+        x_s = scaler.transform(x).reshape(-1).astype(np.float32)
+        buf.append(x_s)
+        if len(buf) < seq_len:
+            return UNCERTAIN
+        seq = np.stack(list(buf), axis=0)                  # (T,3)
+        xt = torch.from_numpy(seq).unsqueeze(0).to(dev)    # (1,T,3)
         with torch.no_grad():
             logits = net(xt)
-            pred = int(torch.argmax(logits, dim=1).item())
-        return pred
+            probs = F.softmax(logits, dim=1).cpu().numpy()[0]
+        cls = int(np.argmax(probs))
+        if cls == 0:
+            return DOWN
+        if cls == 1:
+            return UP
+        return UNCERTAIN
 
-    return predict_window
+    return predict_frame
+
 
 # =========================
-# Pass 1: Extract features + weak GT once
+# Video feature extraction
 # =========================
-def extract_video_features(video_path, cfg):
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video not found: {video_path}")
-
+def extract_video(video_path, cfg):
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(
         static_image_mode=False,
@@ -339,261 +359,149 @@ def extract_video_features(video_path, cfg):
 
     feats_list = []
     gt_list = []
-    frame_count = 0
 
-    n_no_landmarks = 0
-    n_bad_vis = 0
-    n_ok = 0
+    diag = {"frames_read": 0, "no_landmarks": 0, "bad_vis": 0, "ok_frames": 0}
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frame_count += 1
-        if cfg["max_frames"] > 0 and frame_count > cfg["max_frames"]:
+        diag["frames_read"] += 1
+        if cfg["max_frames"] > 0 and diag["frames_read"] > cfg["max_frames"]:
             break
 
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(image_rgb)
+        results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         if not results.pose_landmarks:
-            n_no_landmarks += 1
+            diag["no_landmarks"] += 1
             continue
 
         lm = results.pose_landmarks.landmark
-        if not valid_pose_side_friendly(lm, vis_thresh=cfg["vis_thresh"], min_ok=cfg["min_ok"]):
-            n_bad_vis += 1
+        if not valid_pose(lm, cfg["vis_thresh"], cfg["min_ok"]):
+            diag["bad_vis"] += 1
             continue
 
-        n_ok += 1
         feats = extract_features_from_landmarks(lm, frame.shape)
         gt = label_rule(lm, feats)
 
         feats_list.append(feats)
-        gt_list.append(int(gt))
-
-        if cfg["progress_every"] > 0 and (frame_count % cfg["progress_every"] == 0):
-            print(f"[INFO] frames={frame_count} ok={n_ok} no_lm={n_no_landmarks} bad_vis={n_bad_vis} kept={len(feats_list)}",
-                  flush=True)
+        gt_list.append(gt)
+        diag["ok_frames"] += 1
 
     cap.release()
-
-    diag = {
-        "frames_read": frame_count,
-        "no_landmarks": n_no_landmarks,
-        "bad_vis": n_bad_vis,
-        "ok_frames": n_ok,
-        "kept_frames": len(feats_list),
-    }
     return feats_list, gt_list, diag
 
+
 # =========================
-# Pass 2: Evaluate one model
+# Main evaluation per model
 # =========================
-def evaluate_one_model(model_name, feats_list, gt_list, cfg):
+def eval_one_model(model_name, feats_list, gt_list, cfg):
     model_name = model_name.lower()
 
-    # pick predictor + mode automatically
     if model_name in ("logistic", "mlp"):
         mode = "frame"
-        pred_fn_frame = load_sklearn_predictor(cfg["models_dir"], model_name, thresh=cfg["thresh"])
-        y_true = np.array(gt_list, dtype=int)
-        y_pred = np.array([pred_fn_frame(f) for f in feats_list], dtype=int)
-
-    elif model_name in ("lstm", "lstm_attn", "attn"):
+        predict = load_sklearn(cfg["models_dir"], model_name, thresh=cfg["thresh"])
+    elif model_name in ("lstm", "lstm_attn", "attn", "tcn"):
         mode = "window"
-        pred_fn_window = load_torch_predictor(cfg["models_dir"], model_name, device=cfg["device"])
-
-        seq_len = int(cfg["seq_len"])
-        mid = seq_len // 2
-        buf_f = deque(maxlen=seq_len)
-        buf_g = deque(maxlen=seq_len)
-
-        y_true, y_pred = [], []
-        for f, g in zip(feats_list, gt_list):
-            buf_f.append(f)
-            buf_g.append(g)
-            if len(buf_f) == seq_len:
-                seq = np.stack(list(buf_f), axis=0)
-                gt_mid = int(list(buf_g)[mid])
-                pred = int(pred_fn_window(seq))
-                y_true.append(gt_mid)
-                y_pred.append(pred)
-
-        y_true = np.array(y_true, dtype=int)
-        y_pred = np.array(y_pred, dtype=int)
-
+        predict = load_torch_seq(cfg["models_dir"], model_name, device=cfg["device"], seq_len=cfg["seq_len"])
     else:
         raise ValueError(f"Unsupported model: {model_name}")
 
-    # filtering / labels
+    y_true = np.asarray(gt_list, dtype=int)
+    y_pred = np.asarray([predict(f) for f in feats_list], dtype=int)
+
+    # classification labels
     if cfg["include_uncertain"]:
         labels = [DOWN, UP, UNCERTAIN]
-        target_names = ["DOWN(0)", "UP(1)", "UNCERTAIN(-1)"]
+        names = ["DOWN(0)", "UP(1)", "UNCERTAIN(-1)"]
         yt, yp = y_true, y_pred
     else:
+        # strict 2-class (filter uncertain in BOTH true/pred)
         mask = np.isin(y_true, [DOWN, UP]) & np.isin(y_pred, [DOWN, UP])
         yt, yp = y_true[mask], y_pred[mask]
         labels = [DOWN, UP]
-        target_names = ["DOWN(0)", "UP(1)"]
-
-    if len(yt) == 0:
-        meta = collect_model_params(cfg["models_dir"], model_name)
-        return {
-            "model": model_name,
-            "mode": mode,
-            "n_total": int(len(y_true)),
-            "n_eval": 0,
-            "confusion_matrix": None,
-            "report": None,
-            "model_params": meta,
-            "hint": "All samples filtered out. Try include_uncertain=True or reduce thresh.",
-        }
+        names = ["DOWN(0)", "UP(1)"]
 
     cm = confusion_matrix(yt, yp, labels=labels)
-    report = classification_report(yt, yp, labels=labels, target_names=target_names, digits=4)
+    report = classification_report(yt, yp, labels=labels, target_names=names, digits=4)
+
+    # counting (always 2-class reps, ignore UNCERTAIN by default)
+    count_true = count_reps(y_true, min_consistent=cfg["count_min_consistent"],
+                           transition=cfg["count_transition"], ignore_uncertain=not cfg["count_include_uncertain"])
+    count_pred = count_reps(y_pred, min_consistent=cfg["count_min_consistent"],
+                           transition=cfg["count_transition"], ignore_uncertain=not cfg["count_include_uncertain"])
+    abs_err = abs(int(count_true) - int(count_pred))
 
     return {
         "model": model_name,
         "mode": mode,
         "n_total": int(len(y_true)),
         "n_eval": int(len(yt)),
-        "labels": labels,
-        "target_names": target_names,
-        "confusion_matrix": cm.tolist(),
+        "confusion_matrix": cm,
         "report": report,
+        "count_true": int(count_true),
+        "count_pred": int(count_pred),
+        "count_abs_error": int(abs_err),
     }
 
-# =========================
-# Save outputs
-# =========================
-def save_outputs(video_path, cfg, diag, per_model_results):
-    os.makedirs(cfg["out_dir"], exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    base = os.path.splitext(os.path.basename(video_path))[0]
-    run_name = f"{base}__{ts}"
 
-    out_json = os.path.join(cfg["out_dir"], f"{run_name}.json")
-    out_txt = os.path.join(cfg["out_dir"], f"{run_name}.txt")
-
-    payload = {
-        "video": os.path.abspath(video_path),
-        "timestamp": ts,
-        "config": cfg,
-        "diagnostics": diag,
-        "results": per_model_results,
-    }
-
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    # human-readable
-    lines = []
-    lines.append("=" * 80)
-    lines.append(f"Video: {payload['video']}")
-    lines.append(f"Time : {ts}")
-    lines.append("-" * 80)
-    lines.append("Config:")
-    for k, v in cfg.items():
-        lines.append(f"  {k}: {v}")
-    lines.append("-" * 80)
-    lines.append("Diagnostics:")
-    for k, v in diag.items():
-        lines.append(f"  {k}: {v}")
-    lines.append("=" * 80)
-
-    for r in per_model_results:
-        lines.append(f"Model: {r['model']} | Mode: {r['mode']} | total={r['n_total']} eval={r['n_eval']}")
-        if r["confusion_matrix"] is None:
-            lines.append(f"  [NO REPORT] {r.get('hint','')}")
-        else:
-            lines.append("Confusion matrix (rows=true, cols=pred):")
-            lines.append(str(np.array(r["confusion_matrix"], dtype=int)))
-            lines.append("Report:")
-            lines.append(r["report"])
-        lines.append("-" * 80)
-
-    with open(out_txt, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    return out_json, out_txt
-
-# =========================
-# Main
-# =========================
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--video", required=True)
-    # optional overrides (if you don’t pass, DEFAULT_CFG is used)
-    p.add_argument("--models_dir", default=None)
-    p.add_argument("--models", nargs="*", default=None)  # e.g. --models logistic mlp
-    p.add_argument("--seq_len", type=int, default=None)
-    p.add_argument("--thresh", type=float, default=None)
-    p.add_argument("--device", default=None)
-    p.add_argument("--vis_thresh", type=float, default=None)
-    p.add_argument("--min_ok", type=int, default=None)
+    p.add_argument("--models_dir", default="../models")
+    p.add_argument("--models", nargs="+", default=["logistic", "mlp", "lstm", "lstm_attn", "tcn"])
+    p.add_argument("--seq_len", type=int, default=16)
+    p.add_argument("--thresh", type=float, default=0.75)
+    p.add_argument("--device", default="cpu")
     p.add_argument("--include_uncertain", action="store_true")
-    p.add_argument("--max_frames", type=int, default=None)
-    p.add_argument("--out_dir", default=None)
+
+    # mediapipe
+    p.add_argument("--vis_thresh", type=float, default=0.25)
+    p.add_argument("--min_ok", type=int, default=4)
+    p.add_argument("--model_complexity", type=int, default=2)
+    p.add_argument("--det_conf", type=float, default=0.3)
+    p.add_argument("--track_conf", type=float, default=0.3)
+
+    # limit
+    p.add_argument("--max_frames", type=int, default=0)
+
+    # counting config
+    p.add_argument("--count_transition", default="down2up", choices=["down2up", "up2down"])
+    p.add_argument("--count_min_consistent", type=int, default=4)
+    p.add_argument("--count_include_uncertain", action="store_true",
+                   help="If set, UNCERTAIN participates in debounce stability (not recommended).")
+
     return p.parse_args()
 
-def merge_cfg(args):
-    cfg = dict(DEFAULT_CFG)
-
-    # override by args if provided
-    if args.models_dir is not None: cfg["models_dir"] = args.models_dir
-    if args.models is not None and len(args.models) > 0: cfg["models"] = args.models
-    if args.seq_len is not None: cfg["seq_len"] = args.seq_len
-    if args.thresh is not None: cfg["thresh"] = args.thresh
-    if args.device is not None: cfg["device"] = args.device
-    if args.vis_thresh is not None: cfg["vis_thresh"] = args.vis_thresh
-    if args.min_ok is not None: cfg["min_ok"] = args.min_ok
-    if args.max_frames is not None: cfg["max_frames"] = args.max_frames
-    if args.out_dir is not None: cfg["out_dir"] = args.out_dir
-
-    # include_uncertain only from flag (default False)
-    cfg["include_uncertain"] = bool(args.include_uncertain)
-
-    return cfg
 
 def main():
     args = parse_args()
-    cfg = merge_cfg(args)
+    cfg = vars(args)
 
-    print("[INFO] Using config:")
-    for k, v in cfg.items():
-        print(f"  {k}: {v}")
+    print("=" * 80)
+    print("Config:")
+    for k in sorted(cfg.keys()):
+        print(f"  {k}: {cfg[k]}")
+    print("=" * 80)
 
-    feats_list, gt_list, diag = extract_video_features(args.video, cfg)
+    feats_list, gt_list, diag = extract_video(args.video, cfg)
+    print("Diagnostics:", diag)
+    print(f"Collected frames: {len(feats_list)}")
     if len(feats_list) == 0:
-        print("=" * 80)
-        print("No usable frames collected.")
-        print("Diagnostics:", diag)
-        print("Hint: Try increasing model_complexity, lowering det/track_conf, or relaxing vis_thresh/min_ok.")
-        print("=" * 80)
+        print("No usable frames. Try relaxing vis_thresh/min_ok or mediapipe conf settings.")
         return
 
-    per_model_results = []
-    for m in cfg["models"]:
-        try:
-            r = evaluate_one_model(m, feats_list, gt_list, cfg)
-        except Exception as e:
-            r = {
-                "model": m,
-                "mode": "N/A",
-                "n_total": 0,
-                "n_eval": 0,
-                "confusion_matrix": None,
-                "report": None,
-                "hint": f"{type(e).__name__}: {e}",
-            }
-        per_model_results.append(r)
+    for m in args.models:
+        r = eval_one_model(m, feats_list, gt_list, cfg)
+        print("=" * 80)
+        print(f"Model: {r['model']} | Mode: {r['mode']} | total={r['n_total']} eval={r['n_eval']}")
+        print("Confusion matrix (rows=true, cols=pred):")
+        print(r["confusion_matrix"])
+        print(r["report"])
+        print(f"Count: true={r['count_true']} pred={r['count_pred']} abs_error={r['count_abs_error']} "
+              f"(transition={cfg['count_transition']} min_consistent={cfg['count_min_consistent']} "
+              f"ignore_uncertain={not cfg['count_include_uncertain']})")
+        print("=" * 80)
 
-    out_json, out_txt = save_outputs(args.video, cfg, diag, per_model_results)
-
-    print("=" * 80)
-    print(f"Saved JSON: {out_json}")
-    print(f"Saved TXT : {out_txt}")
-    print("=" * 80)
 
 if __name__ == "__main__":
     main()
