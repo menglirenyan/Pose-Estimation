@@ -1,1 +1,19 @@
-/READme.md
+# 虚拟环境（关键：避免venv文件被Git追踪）
+.venv/
+# Python缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# 视频文件
+*.mp4
+*.avi
+*.mov
+# 模型文件（大文件，不建议Git管理）
+src/models/*.pt
+src/models/*.json
+src/models/*.joblib
+# 评估输出文件夹
+src/eval/eval_outputs/
+# 换行符警告相关（可选，避免LF/CRLF提示）
+*.py text eol=lf
