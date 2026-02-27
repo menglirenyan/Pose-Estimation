@@ -1,47 +1,76 @@
-## Pose Estimation
+# 基于姿态识别的俯卧撑动作检测系统
+本毕业设计旨在串联机器学习到深度学习的知识体系，实现基于单摄像头+MediaPipe的俯卧撑动作检测、状态识别与计数，并对比不同算法的性能表现。
 
-### Exercise Count tracker and Form Validator
+## 项目简介
+### 核心目标
+通过人体姿态关键点提取、特征工程与多模型对比，完成俯卧撑动作的状态识别（如：标准/不标准/准备/完成）与计数逻辑验证，构建从机器学习到深度学习的完整技术链路。
+### 技术栈
+- 关键点提取：MediaPipe Pose
+- 数据处理：Python、OpenCV、Pandas、NumPy（数据清洗、标注、特征计算）
+- 模型训练：Scikit-learn（Logistic Regression）、PyTorch/TensorFlow（MLP、LSTM、Attention-LSTM）
+- 评估指标：混淆矩阵、Precision/Recall/F1-Score、准确率
 
-*Run the following command.*
+## 项目结构
+```
+├── data/                # 俯卧撑数据集（标注文件、原始视频/图片）
+├── feature/             # 特征工程代码（肘角、肩髋距离等特征计算）
+├── models/              # 模型定义（LR、MLP、LSTM、Attention-LSTM）
+├── evaluate/            # 离线评估代码（指标计算、混淆矩阵绘制）
+├── utils/               # 工具函数（关键点提取、数据标注、计数逻辑）
+├── main.py              # 主运行脚本（数据处理→训练→评估）
+├── requirements.txt     # 依赖包清单
+└── results/             # 评估结果（混淆矩阵图、指标报表）
+```
 
-`git clone [repo-name].git`
+## 环境配置
+1. 克隆本仓库：
+```bash
+git clone [你的仓库地址]
+cd 俯卧撑动作检测系统
+```
+2. 安装依赖：
+```bash
+pip install -r requirements.txt
+# 补充：MediaPipe、OpenCV 若需单独安装
+pip install mediapipe opencv-python
+```
 
-`pip install -r requirements.txt`
+## 快速运行
+### 1. 数据集准备
+将标注好的俯卧撑动作视频/图片放入 `data/` 目录，运行特征提取脚本：
+```bash
+python feature/extract_features.py
+```
+### 2. 模型训练与对比
+```bash
+# 运行所有模型训练与评估
+python main.py
+```
+### 3. 查看评估结果
+训练完成后，评估指标与混淆矩阵会保存至 `results/` 目录，可直接查看可视化结果。
 
-*this installs the required libraries (tensorflow for macos)*
+## 核心模块说明
+### 1. 关键点提取
+基于 MediaPipe Pose 提取人体 33 个关键点，聚焦俯卧撑相关关节（肘部、肩部、髋部），输出关键点坐标与置信度。
+### 2. 特征工程
+- 肘角：计算肘部关节的角度（判断手臂弯曲程度）；
+- 肩髋距离：计算肩部与髋部关键点的欧式距离（判断身体是否保持平直）；
+- 时序特征：对连续帧关键点序列进行归一化、差分处理（适配LSTM/Attention-LSTM）。
+### 3. 模型对比
+| 模型          | 适用场景                | 核心优势                  |
+|---------------|-------------------------|---------------------------|
+| Logistic Regression | 静态动作二分类          | 轻量、易解释              |
+| MLP           | 静态特征多分类          | 非线性拟合能力            |
+| LSTM          | 时序动作识别            | 捕捉长短期时序依赖        |
+| Attention-LSTM| 时序动作关键帧聚焦      | 强化重要帧的特征权重      |
+### 4. 离线评估
+输出各模型的混淆矩阵（可视化）、Precision/Recall/F1-Score 表格，对比不同模型的动作识别精度与计数准确率。
 
-To test this project, replace the video footage path in the `path` placeholder in the `pose_enhanced_trainer.py` script. Keep the video such that the side view of the person is visible and accordingly as per view of arm, find the angle for left or right arm.
+## 结果展示
+- 混淆矩阵示例：`results/confusion_matrix_attention_lstm.png`
+- 指标汇总表：`results/metrics_summary.csv`
+- 俯卧撑计数可视化：`results/count_demo.mp4`（可选）
 
-### How to run the project?
-
-Navigate into the project directory after cloning the project and then run,
-`python3 pose_enhanced_trainer.py`
-
-### Methodology and Working Explained: 
-
-This is an implementation of computer vision technique called Pose Estimation and landmark tracking to track certain landmarks of interest and leverage the use of Pose Estimation library Mediapipe to count the proper bicep curls.
-
-To implement this methodlogy, first Pose module is made which contains the basic functionality of drawing the Pose landmark coordinates and finding the position of that particular landmark.
-
-The `findPose()` function draws the landmark coordinates upon the image frame using mediapipe library- draw_landmarks. 
-
-The `findPosition()` function is used to store the list of all the landmarks having `[landmark_id, x_coordinate, y_coordinate]`.
-
-Then we have `findAngle()` function to calculate the angle between 3 landmark points, using the maths formula `to_degrees[atan2(p3_y-p2_y, p3_x-p2_x) - atan2(p1_y-p2_y,p1_x-p2_x)]` where p1, p2 and p3 are the points of interest. The angle being found around p2 point. `_x` and `_y` being the x and the y coordinates respectively.
-
-The angle between these 3 points of interest is found and negative angle is then converted into the rangle of (0,360). Then optionally as per visual preference to separate the landmarks of interest from all landmarks, additional elements, like drawing concentric circles for specific landmarks and then joining them with a line is done.
-
-For now, this implementation was tested on a stock footage of a person doing bicep curls and only the Right arm was taken into consideration, being prominently visible in the frame. Then the respective landmarks of the right arm were passed as the points (p1,p2,p3) which cooresponds to the landmark_id in the list containing all the landmark id and the coordinates. Then the angle is calculated for every frame.
-
-After getting the angle, the minimum and the maximum angle range can be saved for the next part of the implementation. *It is important to know the possible minimum and maximum values of angles reached.*
-
-With our minimum and maximum angle range values, the angle range is then converted into a range of `(0,100)` using the numpy `interp` function. This is done to give a better intuitive understanding of range variation on scale of (0,100) when the angle is changed upon doing bicep curls. 
-
-Then for counting curls, the logic used is to assign a direction for up and down direction while doing a curl. When the percentage (the value interpolated with the angle range) is 100, then it means that the person is going up, therefore half of curl is incremented and the direction is changed to down. Afterwards, when the percentage is 0, then it means that the person is doing a downward curl and again the curl count is incremented by 0.5 and direction changed to up. Finally when the person makes a movement in both upwards and downwards direction, then and then only a full curl is counted.
-
-Finally, for visual depiction to aid with intuition of curl motion, the range of angle is interpolated with a range value of a rectangular bar to be filled as per variations in angle.
-*This part is completely optional and just for my intuition of motion and visual appeasement.*
-
-Similarly, this methodology can be implemented for any body part exercise that revolves around doing the exercise with a precision of angle/ acceptable angle range, to count proper valid repititions of that exercise. 
-
-**This was tested on Macbook M1 Air CPU with a decent FPS**
+## 致谢
+感谢指导老师的建议，以及 MediaPipe、Scikit-learn、PyTorch 等开源库的支持。
+```
