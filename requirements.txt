@@ -1,4 +1,1 @@
-opencv-python
-mediapipe
-tensorflow-macos
 
